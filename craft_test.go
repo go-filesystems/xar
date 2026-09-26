@@ -477,11 +477,21 @@ func TestSpecialTypes(t *testing.T) {
 	}
 }
 
-// TestReadFileGrowsRatherThanTrusting is the allocation guard. The member says
-// it is 2 GiB and its stream holds five bytes; ReadFile must fail on the data
-// without having tried to reserve the declared size.
+// TestReadFileGrowsRatherThanTrusting is the allocation guard, and the declared
+// size is chosen so that the guard is the only thing that can pass it.
+//
+// A table of contents is untrusted input and its <size> is not bounded by the
+// archive's own length, so a ReadFile that sizes its buffer from <size> hands a
+// few hundred bytes of XML control over an allocation of any size. The obvious
+// test -- declare 2 GiB, assert an error -- does NOT catch that: the buffer is
+// allocated, the data runs out five bytes in, and the same ErrCorrupt comes
+// back. The test passes while the defect is fully present.
+//
+// This member declares 256 TiB. A reader that reserves the declared size cannot
+// get that far and dies; a reader that grows from what it actually reads returns
+// ErrCorrupt after five bytes.
 func TestReadFileGrowsRatherThanTrusting(t *testing.T) {
-	f := withMember(t, encodingZlib, 2<<30, zlibBytes([]byte("short")))
+	f := withMember(t, encodingZlib, 1<<48, zlibBytes([]byte("short")))
 	got, err := f.ReadFile("/hello.txt")
 	if err == nil {
 		t.Fatalf("ReadFile returned %d bytes for a member that holds five", len(got))
