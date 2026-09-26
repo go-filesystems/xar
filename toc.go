@@ -197,6 +197,18 @@ func addChildren(parent *entry, files []xmlFile, index map[string]*entry, heap, 
 
 		parent.children = append(parent.children, e)
 		index[e.path] = e
+
+		// Nesting is how XAR spells a directory, so only a directory may nest.
+		// A <file> inside a symlink, a fifo or a regular file describes a path
+		// that cannot exist, and the archive is refused rather than resolved:
+		// dropping such children silently loses members, and keeping them
+		// creates a path whose parent is not a directory -- which is exactly
+		// the case that let this package's index and its tree walk give two
+		// different answers for one path.
+		if len(f.Files) > 0 && e.kind != kindDir {
+			return fmt.Errorf("%w: %q is of type %q but nests %d member(s)",
+				ErrCorrupt, e.path, f.Type, len(f.Files))
+		}
 		if err := addChildren(e, f.Files, index, heap, size); err != nil {
 			return err
 		}

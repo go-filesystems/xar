@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"compress/zlib"
 	"encoding/binary"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
@@ -45,6 +46,11 @@ type crafted struct {
 	tocPayload []byte
 	// truncate, when positive, cuts the finished archive to that many bytes.
 	truncate int
+	// headerPad adds that many bytes between the 28-byte header and the table
+	// of contents, and declares HeaderSize accordingly. /usr/bin/xar always
+	// writes 28, so this is the only way to tell a reader that uses the
+	// DECLARED HeaderSize from one that uses the constant.
+	headerPad int
 }
 
 func zlibBytes(p []byte) []byte {
@@ -65,10 +71,10 @@ func (c *crafted) bytes() []byte {
 	if payload == nil {
 		payload = zlibBytes([]byte(c.toc))
 	}
-	hdr := make([]byte, minHeaderSize)
+	hdr := make([]byte, minHeaderSize+c.headerPad)
 	put := func(i int, v uint32) { binary.BigEndian.PutUint32(hdr[i:], v) }
 	put(0, Magic)
-	binary.BigEndian.PutUint16(hdr[4:], minHeaderSize)
+	binary.BigEndian.PutUint16(hdr[4:], uint16(minHeaderSize+c.headerPad))
 	binary.BigEndian.PutUint16(hdr[6:], version1)
 	binary.BigEndian.PutUint64(hdr[8:], uint64(len(payload)))
 	binary.BigEndian.PutUint64(hdr[16:], uint64(len(c.toc)))
@@ -444,7 +450,8 @@ func TestSpecialTypes(t *testing.T) {
 	c := baseline()
 	// Also drops <mode> from this member, which is the absent-mode case.
 	c.toc = strings.Replace(c.toc,
-		"<mode>0755</mode><type>directory</type><name>d</name>",
+		`<mode>0755</mode><type>directory</type><name>d</name>
+   <file id="4"><mode>0644</mode><type>file</type><name>inner.txt</name></file>`,
 		"<type>fifo</type><name>d</name>", 1)
 	f, err := c.open()
 	if err != nil {
@@ -456,10 +463,8 @@ func TestSpecialTypes(t *testing.T) {
 	if _, err := f.ReadFile("/d"); !errors.Is(err, ErrNotRegular) {
 		t.Errorf("ReadFile(/d) = %v, want ErrNotRegular", err)
 	}
-	// A fifo is not a directory, so its nested <file> children are unreachable
-	// through it -- the walk stops at a non-directory rather than descending.
-	if _, err := f.Stat("/d/inner.txt"); !errors.Is(err, ErrNotFound) {
-		t.Errorf("Stat(/d/inner.txt) = %v, want ErrNotFound", err)
+	if _, err := f.ListDir("/d"); !errors.Is(err, ErrNotDirectory) {
+		t.Errorf("ListDir(/d) = %v, want ErrNotDirectory", err)
 	}
 	entries, err := f.ListDir("/")
 	if err != nil {
@@ -530,4 +535,98 @@ func TestDecoderReturnsAReader(t *testing.T) {
 	if _, err := decoder("application/x-made-up", bytes.NewReader(nil)); !errors.Is(err, ErrUnsupportedEncoding) {
 		t.Errorf("decoder of an unknown style = %v, want ErrUnsupportedEncoding", err)
 	}
+}
+
+// TestNestingUnderANonDirectoryIsRefused pins the refusal that keeps one path
+// from having two answers.
+//
+// Nesting is the only way XAR expresses a directory, so a <file> nested inside a
+// fifo, a symlink or a regular file names a path whose parent is not a
+// directory. Dropping those members loses them silently; keeping them makes a
+// path resolvable by one route and not by another. This package refuses the
+// archive, which is the only one of the three a caller can act on.
+func TestNestingUnderANonDirectoryIsRefused(t *testing.T) {
+	for _, typ := range []string{"fifo", "symlink", "file"} {
+		c := baseline()
+		c.toc = strings.Replace(c.toc,
+			"<mode>0755</mode><type>directory</type><name>d</name>",
+			"<mode>0755</mode><type>"+typ+"</type><name>d</name>", 1)
+		if _, err := c.open(); !errors.Is(err, ErrCorrupt) {
+			t.Errorf("a %q nesting a member = %v, want ErrCorrupt", typ, err)
+		}
+	}
+}
+
+// TestDeclaredHeaderSizeLocatesEverything is the assertion that a corpus of real
+// archives CANNOT make.
+//
+// HeaderSize exists so the header can grow, and both the table of contents and
+// the heap are located from it: the TOC starts at HeaderSize and the heap at
+// HeaderSize + TOCLengthCompressed. Every archive /usr/bin/xar writes declares
+// 28, which is also the size of the header this package knows, so in the real
+// fixtures the declared field and the constant are the same number and a reader
+// that used the constant would pass every one of them.
+//
+// This archive declares 32 and puts four bytes of padding there. A reader using
+// the constant reads the padding as the head of the zlib stream, or lands four
+// bytes into the heap, and cannot produce these bytes either way.
+func TestDeclaredHeaderSizeLocatesEverything(t *testing.T) {
+	c := baseline()
+	c.headerPad = 4
+	f, err := c.open()
+	if err != nil {
+		t.Fatalf("an archive with a 32-byte header must open: %v", err)
+	}
+	for _, tc := range []struct{ path, body string }{
+		{"/hello.txt", "hello\n"},
+		{"/raw.bin", "0123456789"},
+	} {
+		got, err := f.ReadFile(tc.path)
+		if err != nil {
+			t.Fatalf("ReadFile(%q): %v", tc.path, err)
+		}
+		if string(got) != tc.body {
+			t.Errorf("ReadFile(%q) = %q, want %q -- the heap was located from the constant 28, not from HeaderSize",
+				tc.path, got, tc.body)
+		}
+	}
+}
+
+// TestTOCLongerThanDeclaredWithValidPrefix is the case that makes the declared
+// uncompressed length matter.
+//
+// The suite already had a "longer than declared" case, and removing the check
+// that enforces it did not fail anything: declaring one byte fewer cut the XML
+// mid-document, and the XML parser rejected it. The test was green for the wrong
+// reason, and it would have stayed green with the length never enforced at all.
+//
+// Here the table of contents ends in a newline, so its first len-1 bytes are
+// still a complete, valid document. Only the check that the zlib stream is
+// FINISHED at the declared length can tell that the header disagrees with the
+// bytes behind it.
+func TestTOCLongerThanDeclaredWithValidPrefix(t *testing.T) {
+	c := baseline()
+	c.toc += "\n"
+	full := uint64(len(c.toc))
+
+	// The control: declared correctly, the same archive opens.
+	if _, err := c.open(); err != nil {
+		t.Fatalf("the padded table of contents must open when declared correctly: %v", err)
+	}
+	// Now declare one byte fewer. The truncated prefix is still valid XML, so
+	// nothing downstream of the length check can notice.
+	if err := xmlWellFormed(c.toc[:full-1]); err != nil {
+		t.Fatalf("this case only tests what it claims if the prefix parses: %v", err)
+	}
+	c.tocUncompressed = u64(full - 1)
+	if _, err := c.open(); !errors.Is(err, ErrCorrupt) {
+		t.Errorf("open = %v, want ErrCorrupt: the declared uncompressed length is not enforced", err)
+	}
+}
+
+// xmlWellFormed reports whether s parses as the archive document, so the test
+// above can assert its own premise instead of assuming it.
+func xmlWellFormed(s string) error {
+	var arc xmlArchive
+	return xml.Unmarshal([]byte(s), &arc)
 }

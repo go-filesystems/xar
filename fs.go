@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"strings"
 	"sync"
 
@@ -76,35 +77,27 @@ func splitPath(p string) []string {
 	return out
 }
 
-// lookup resolves a path to its entry. Symlinks are NOT followed: an archive's
-// link target is a string the archive supplied, which may name anything at all
-// including a path outside the archive, so resolving it here would answer for
-// something this package cannot see. ReadLink hands the target back and the
-// caller decides.
+// lookup resolves a path to its entry, in one map read.
+//
+// Symlinks are NOT followed: an archive's link target is a string the archive
+// supplied, which may name anything at all including a path outside the
+// archive, so resolving it here would answer for something this package cannot
+// see. ReadLink hands the target back and the caller decides.
+//
+// The index is built alongside the tree and holds every entry under the path the
+// nesting walk gave it, so this and a component-by-component descent of a
+// directory's children cannot disagree. Keeping a second way to resolve a path
+// that nothing calls is how they start to: an earlier version of this file
+// walked the tree here and left the index reachable only from tests, and the two
+// answered differently for a <file> nested inside something that is not a
+// directory. addChildren now refuses that archive outright, so there is one
+// answer and one place it comes from.
 func (f *FS) lookup(p string) (*entry, error) {
-	cur := f.root
-	for _, part := range splitPath(p) {
-		if cur.kind != kindDir {
-			return nil, fmt.Errorf("%w: %s", ErrNotFound, p)
-		}
-		next := cur.child(part)
-		if next == nil {
-			return nil, fmt.Errorf("%w: %s", ErrNotFound, p)
-		}
-		cur = next
+	e := f.index[path.Join("/", strings.Join(splitPath(p), "/"))]
+	if e == nil {
+		return nil, fmt.Errorf("%w: %s", ErrNotFound, p)
 	}
-	return cur, nil
-}
-
-// child finds a named child. The children of a directory are kept sorted by
-// name, so this is a small linear scan over one level.
-func (e *entry) child(name string) *entry {
-	for _, c := range e.children {
-		if c.name == name {
-			return c
-		}
-	}
-	return nil
+	return e, nil
 }
 
 // Stat reports what the table of contents recorded for p.
