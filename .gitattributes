@@ -1,0 +1,8 @@
+* text=auto eol=lf
+*.go text
+
+# The fixtures are byte-exact archives produced by /usr/bin/xar, and the test
+# suite asserts their contents byte for byte. `text=auto` guesses, and a guess
+# that rewrites line endings on the Windows lane would corrupt them, so say it.
+*.xar binary
+*.bin binary
