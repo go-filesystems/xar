@@ -1,3 +1,5 @@
+<p align="center"><img src="https://raw.githubusercontent.com/go-filesystems/brand/main/social/go-filesystems-xar.png" alt="go-filesystems/xar" width="720"></p>
+
 # xar
 
 A pure-Go, read-only reader for the **XAR** (eXtensible ARchive) format — the
