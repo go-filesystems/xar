@@ -118,6 +118,39 @@ specification.
    empty file, which has an `<ea>` and no `<data>`. One that searches for any
    descendant name calls the file `com.apple.provenance`.
 
+## What real `.pkg` files use, measured
+
+The encoding names make `application/x-gzip` look like the format's default,
+because it is what `xar` writes unless told otherwise. Real installers do not
+agree, and **a reader that supports only zlib cannot read Apple's own packages**:
+
+| package | member | encoding | heap → decoded |
+|---|---|---|---|
+| Safari27.0TahoeAuto.pkg (Apple, signed) | `Payload` | `application/octet-stream` | 255,426,183 → 255,426,183 |
+| | `Scripts` | `application/octet-stream` | 18,216 → 18,216 |
+| | `PackageInfo` | `application/x-bzip2` | 529 → 1,002 |
+| | `Bom` | `application/x-bzip2` | 3,448 → 63,198 |
+| GLPI-Agent-1.7.3_arm64.pkg (third party, signed) | `Payload` | `application/octet-stream` | 21,609,167 → 21,609,167 |
+| | `Bom` | `application/x-gzip` | 264,415 → 1,169,586 |
+| | `License.txt` | `application/x-gzip` | 6,819 → 17,987 |
+
+The `Payload` — the part holding the installed files, and by far the largest
+member — is **stored** in both, which is why it is served straight from the
+backing `io.ReaderAt` with nothing buffered. Apple compresses its metadata with
+**bzip2** and not with zlib at all, so `compress/bzip2` is required to read a
+macOS system package rather than being an extra.
+
+Every member above was read through `Opener` and compared against
+`xar -xf`: all byte-identical. Streaming the 255 MB `Payload` peaked at **4.9 MB**
+of resident memory, and the 1.1 MB zlib `Bom` at 5.0 MB, which is the O(1) claim
+above measured rather than asserted.
+
+Both packages are signed. The `<signature>`/`<x-signature>` and X509 elements sit
+beside `<file>` under `<toc>` and are ignored, which is what lets a signed archive
+be read at all — it is **not** a signature check. The GLPI package's
+`Distribution` member also has no `<mode>` element at all, and an absent mode is
+reported as zero permission bits, because that is what the archive recorded.
+
 ## What this package does not do
 
 The header's `ChecksumAlgorithm`, the table of contents' own `<checksum>`, and

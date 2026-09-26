@@ -80,6 +80,40 @@
 // xar 1.8dev reports "lzma support not compiled in" and cannot write one, and a
 // fixture hand-built to agree with this reader would prove nothing about it.
 //
+// # What real .pkg files use, measured
+//
+// The encoding names above make "application/x-gzip" look like the format's
+// default, because it is what /usr/bin/xar writes unless told otherwise. Real
+// installers do not agree, and a reader that supports only zlib cannot read
+// Apple's own packages at all:
+//
+//	Safari27.0TahoeAuto.pkg  (Apple, signed, 255 MB)
+//	  Payload      application/octet-stream   255,426,183 -> 255,426,183
+//	  Scripts      application/octet-stream        18,216 ->      18,216
+//	  PackageInfo  application/x-bzip2                529 ->       1,002
+//	  Bom          application/x-bzip2              3,448 ->      63,198
+//
+//	GLPI-Agent-1.7.3_arm64.pkg  (third party, signed, nested)
+//	  Payload      application/octet-stream    21,609,167 -> 21,609,167
+//	  Bom          application/x-gzip             264,415 ->  1,169,586
+//	  License.txt  application/x-gzip               6,819 ->      17,987
+//
+// So: the Payload — the part that holds the installed files, and the largest
+// member by far — is STORED in both, which is why it is served here straight
+// from the backing io.ReaderAt with no buffering. Apple compresses its metadata
+// with BZIP2 and not with zlib at all, so compress/bzip2 is required to read a
+// macOS system package, not an extra.
+//
+// Both packages are signed. The <signature>/<x-signature> and X509 elements sit
+// beside <file> under <toc> and are ignored here, which is what lets a signed
+// archive be read at all; see the note above on what that does and does not
+// mean.
+//
+// Also measured: the Distribution member of the GLPI package has NO <mode>
+// element, only <data>, <type> and <name>. An absent mode is reported as zero
+// permission bits, because that is what the archive recorded -- not 0644 guessed
+// on its behalf.
+//
 // Extended attributes, uid/gid, the timestamps and the Finder metadata are
 // read past. An archive is read-only: every mutating method of
 // filesystem.Filesystem returns ErrReadOnly.
