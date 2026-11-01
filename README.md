@@ -153,6 +153,32 @@ be read at all — it is **not** a signature check. The GLPI package's
 `Distribution` member also has no `<mode>` element at all, and an absent mode is
 reported as zero permission bits, because that is what the archive recorded.
 
+## Untrusted input
+
+An archive is attacker-controlled bytes, and every size in it is a claim. Nothing
+is allocated from a claim before it has been checked, and the limits are named:
+
+| what the archive claims | bounded by | on excess |
+|---|---|---|
+| `TOCLengthUncompressed` | at most 1032 × `TOCLengthCompressed` (the most a zlib stream can expand, [zlib.net/zlib_tech.html](https://zlib.net/zlib_tech.html)) and at most 64 MiB | `ErrBadHeader` |
+| a zlib member's `<size>` | at most 1032 × its `<length>` | `ErrCorrupt` at open, so `Stat` never reports an impossible size |
+| number of `<file>` entries | `Options.MaxEntries` (default 1,048,576), counted by a byte scan **before** the XML is decoded | `ErrTooLarge` |
+| a member's path | 4096 bytes each (Linux `PATH_MAX`), 256 MiB for all paths together | `ErrTooLarge` |
+| what `ReadFile` buffers | `Options.MaxFileSize` (default 1 GiB) | `ErrTooLarge`, before reading |
+
+`OpenReaderWith(r, size, xar.Options{MaxEntries: …, MaxFileSize: …})` changes the
+last two. `OpenFile` streams in constant memory and has no ceiling; use it for
+members whose size you did not choose. bzip2 has no usable ratio (a block of zeros
+is about a million to one), so only the ceiling stops a bzip2 member from filling
+memory in `ReadFile`, and a streaming read of one costs CPU in proportion to the
+output the caller asks for.
+
+Before these limits a 347-byte archive reserved 64 MiB, an 8.9 KB archive (a chain
+of 3000 directories) allocated 937 MB because every entry stores its whole path,
+and a 526 KB zlib member read through `ReadFile` allocated 1 GiB. The tests in
+`bombs_test.go` pin each limit exactly (at the bound passes, one over is refused)
+and measure `TotalAlloc`; `FuzzOpenReader` and `FuzzTOC` cover the parsers.
+
 ## What this package does not do
 
 The header's `ChecksumAlgorithm`, the table of contents' own `<checksum>`, and
@@ -212,7 +238,7 @@ assertion rather than a harmless one:
 |---|---|---|
 | heap base uses the constant 28 instead of `HeaderSize` | **nothing** — every archive xar writes declares 28, so the field and the constant are the same number in every real fixture | `TestDeclaredHeaderSizeLocatesEverything`, a crafted archive with a 32-byte header |
 | the declared `TOCLengthUncompressed` is not enforced | **nothing** — the existing case declared one byte fewer, which cut the XML mid-document, so the XML parser caught it and the length check was never reached | `TestTOCLongerThanDeclaredWithValidPrefix`, whose table of contents ends in a newline so the short prefix is still valid XML |
-| `ReadFile` sizes its buffer from the untrusted `<size>` | **nothing that mattered** — the test declared 2 GiB and asserted an error, and the allocating version allocated 2 GiB and returned the same error | the declared size is now 256 TiB, which a reader that trusts it cannot survive |
+| `ReadFile` sizes its buffer from the untrusted `<size>` | **nothing that mattered** — the test declared 2 GiB and asserted an error, and the allocating version allocated 2 GiB and returned the same error | the declared size is now the most a five-byte zlib member may honestly declare (13 × 1032), and a larger lie is refused at open, see `TestZlibMemberBeyondTheRatio` |
 
 ## Licence
 

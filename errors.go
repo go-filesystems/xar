@@ -38,6 +38,14 @@ var (
 	// member whose data stops before its declared size.
 	ErrCorrupt = errors.New("xar: corrupt archive")
 
+	// ErrTooLarge is returned when an archive asks for more than a limit allows:
+	// more entries than Options.MaxEntries, a path longer than 4096 bytes or
+	// paths that together exceed 256 MiB, or a ReadFile of a member larger than
+	// Options.MaxFileSize. It is raised BEFORE the memory is reserved. The
+	// archive is not necessarily corrupt; raise the limit, or stream the member
+	// with OpenFile, if the size is expected.
+	ErrTooLarge = errors.New("xar: exceeds the size limit")
+
 	// ErrUnsupportedEncoding is returned when a member's encoding style is one
 	// this package cannot decode. It is raised when the member's data is read,
 	// not when the archive is opened, so one undecodable member does not make

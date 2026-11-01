@@ -4,6 +4,7 @@
 package xar
 
 import (
+	"bytes"
 	"compress/zlib"
 	"encoding/xml"
 	"fmt"
@@ -113,7 +114,7 @@ type entry struct {
 }
 
 // readTOC decompresses and parses the table of contents.
-func readTOC(r io.ReaderAt, h *header) (*xmlArchive, error) {
+func readTOC(r io.ReaderAt, h *header, maxEntries int) (*xmlArchive, error) {
 	raw := io.NewSectionReader(r, int64(h.headerSize), int64(h.tocCompressed))
 	zr, err := zlib.NewReader(raw)
 	if err != nil {
@@ -136,6 +137,16 @@ func readTOC(r io.ReaderAt, h *header) (*xmlArchive, error) {
 			ErrCorrupt, h.tocUncompressed)
 	}
 
+	// Count the <file> elements BEFORE xml.Unmarshal builds a struct for each.
+	// Unmarshal costs about thirty bytes of heap per byte of XML, so a 64 MiB
+	// table of contents of minimal entries is two gigabytes; the count is a
+	// byte scan, and it cannot undercount: an element named file is "<file"
+	// followed by white space, '>' or '/'.
+	if n := countFileElements(buf); n > maxEntries {
+		return nil, fmt.Errorf("%w: the table of contents holds %d entries, the limit is %d",
+			ErrTooLarge, n, maxEntries)
+	}
+
 	var arc xmlArchive
 	if err := xml.Unmarshal(buf, &arc); err != nil {
 		return nil, fmt.Errorf("%w: table of contents XML: %w", ErrCorrupt, err)
@@ -143,12 +154,48 @@ func readTOC(r io.ReaderAt, h *header) (*xmlArchive, error) {
 	return &arc, nil
 }
 
+// countFileElements counts the "<file" start tags in a table of contents.
+func countFileElements(b []byte) int {
+	n := 0
+	for {
+		i := bytes.Index(b, []byte("<file"))
+		if i < 0 || i+5 >= len(b) {
+			return n
+		}
+		switch b[i+5] {
+		case ' ', '\t', '\r', '\n', '>', '/':
+			n++
+		}
+		b = b[i+5:]
+	}
+}
+
+const (
+	// maxPathLen is the longest path accepted: Linux's PATH_MAX. A path longer
+	// than that cannot be extracted anywhere. It matters for memory because every
+	// entry stores its whole path: a chain of D directories with names of L bytes
+	// holds L*D*D/2 bytes of paths, and the encoding/xml depth limit of 10000
+	// lets a 9 KiB archive ask for gigabytes.
+	maxPathLen = 4096
+
+	// maxPathBytes bounds all the stored paths together: wide trees of long paths
+	// each pass maxPathLen and still add up.
+	maxPathBytes = 256 << 20
+)
+
+// treeLimits is what buildTree has spent so far.
+type treeLimits struct {
+	heap, size   int64
+	pathBytes    int
+	maxPathBytes int
+}
+
 // buildTree turns the nested <file> elements into an entry tree rooted at a
 // synthetic directory, and indexes every entry by its absolute path.
 func buildTree(arc *xmlArchive, heap, size int64) (*entry, map[string]*entry, error) {
 	root := &entry{name: "", path: "/", kind: kindDir, perm: 0o755}
 	index := map[string]*entry{"/": root}
-	if err := addChildren(root, arc.TOC.Files, index, heap, size); err != nil {
+	if err := addChildren(root, arc.TOC.Files, index, &treeLimits{heap: heap, size: size, maxPathBytes: maxPathBytes}); err != nil {
 		return nil, nil, err
 	}
 	return root, index, nil
@@ -156,13 +203,24 @@ func buildTree(arc *xmlArchive, heap, size int64) (*entry, map[string]*entry, er
 
 // addChildren converts one level of <file> elements into children of parent,
 // recursing into the nesting to build each path.
-func addChildren(parent *entry, files []xmlFile, index map[string]*entry, heap, size int64) error {
+func addChildren(parent *entry, files []xmlFile, index map[string]*entry, lim *treeLimits) error {
+	heap, size := lim.heap, lim.size
 	seen := make(map[string]bool, len(files))
 	for i := range files {
 		f := &files[i]
 		if err := checkName(f.Name); err != nil {
 			return err
 		}
+		// Checked on the arithmetic, before path.Join allocates the string.
+		n := len(parent.path) + len(f.Name)
+		if parent.path != "/" {
+			n++ // the separator; the root's path already ends in one
+		}
+		if n > maxPathLen || lim.pathBytes+n > lim.maxPathBytes {
+			return fmt.Errorf("%w: the path under %q is %d bytes, limits are %d per path and %d in all",
+				ErrTooLarge, parent.path, n, maxPathLen, lim.maxPathBytes)
+		}
+		lim.pathBytes += n
 		if seen[f.Name] {
 			// Two members with one name in one directory. Extracting the
 			// archive would write one over the other, so the archive is
@@ -209,7 +267,7 @@ func addChildren(parent *entry, files []xmlFile, index map[string]*entry, heap, 
 			return fmt.Errorf("%w: %q is of type %q but nests %d member(s)",
 				ErrCorrupt, e.path, f.Type, len(f.Files))
 		}
-		if err := addChildren(e, f.Files, index, heap, size); err != nil {
+		if err := addChildren(e, f.Files, index, lim); err != nil {
 			return err
 		}
 	}
@@ -252,6 +310,14 @@ func checkExtent(e *entry, heap, size int64) error {
 	if stored(e.style) && e.length != e.size {
 		return fmt.Errorf("%w: %q is stored but declares length %d and size %d",
 			ErrCorrupt, e.path, e.length, e.size)
+	}
+	// A zlib member cannot decode to more than zlibMaxRatio times its encoded
+	// length. Stat reports e.size, and callers size buffers from it, so a lie is
+	// refused here instead of being handed on. (bzip2 has no usable bound -- a
+	// block of zeros is a million to one -- so its ceiling is ReadFile's.)
+	if e.style == encodingZlib && e.size > maxInflate(e.length) {
+		return fmt.Errorf("%w: %q is %d zlib bytes and declares %d decoded (at most %d:1)",
+			ErrCorrupt, e.path, e.length, e.size, zlibMaxRatio)
 	}
 	return nil
 }

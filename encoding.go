@@ -8,6 +8,7 @@ import (
 	"compress/zlib"
 	"fmt"
 	"io"
+	"math"
 )
 
 // The encoding style strings XAR puts in <encoding style="…"/>.
@@ -25,6 +26,24 @@ const (
 	// encodingBzip2 is a bzip2 stream, and is named after what it is.
 	encodingBzip2 = "application/x-bzip2"
 )
+
+// zlibMaxRatio is the most a zlib stream can expand: 1032 output bytes per input
+// byte. One length/distance pair stands for at most 258 bytes and costs at least
+// two bits (one for the length code, one for the distance code), so eight input
+// bits give four pairs, 1032 bytes. zlib.net/zlib_tech.html states the same
+// figure as the theoretical limit of the format. It is a property of RFC 1950/1951,
+// not of any implementation, so a declared decoded size above it is a lie about
+// the stream, whatever decoder reads it.
+const zlibMaxRatio = 1032
+
+// maxInflate is the largest number of bytes a zlib stream of n bytes can decode
+// to, saturating instead of overflowing.
+func maxInflate(n int64) int64 {
+	if n > math.MaxInt64/zlibMaxRatio {
+		return math.MaxInt64
+	}
+	return n * zlibMaxRatio
+}
 
 // stored reports whether a style means the bytes in the heap are the bytes of
 // the member. Those entries get true random access, straight through to the
