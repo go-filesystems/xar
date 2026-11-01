@@ -341,6 +341,15 @@ func TestTOCTreeRefusals(t *testing.T) {
 // <data> block and heap content.
 func withMember(t *testing.T, style string, size int, heap []byte) *FS {
 	t.Helper()
+	f, err := tryMember(style, size, heap)
+	if err != nil {
+		t.Fatalf("crafting a member with style %q: %v", style, err)
+	}
+	return f
+}
+
+// tryMember is withMember for a case whose open may be refused.
+func tryMember(style string, size int, heap []byte) (*FS, error) {
 	c := baseline()
 	c.toc = strings.Replace(c.toc,
 		fmt.Sprintf(`<data><length>%d</length><offset>0</offset><size>6</size><encoding style="%s"/></data>`,
@@ -352,11 +361,7 @@ func withMember(t *testing.T, style string, size int, heap []byte) *FS {
 		fmt.Sprintf(`<offset>%d</offset>`, len(zlibBytes([]byte("hello\n")))),
 		fmt.Sprintf(`<offset>%d</offset>`, len(heap)), 1)
 	c.heap = append(append([]byte{}, heap...), []byte("0123456789")...)
-	f, err := c.open()
-	if err != nil {
-		t.Fatalf("crafting a member with style %q: %v", style, err)
-	}
-	return f
+	return c.open()
 }
 
 // TestUnsupportedEncoding covers a style this package will not decode. The
@@ -491,7 +496,9 @@ func TestSpecialTypes(t *testing.T) {
 // get that far and dies; a reader that grows from what it actually reads returns
 // ErrCorrupt after five bytes.
 func TestReadFileGrowsRatherThanTrusting(t *testing.T) {
-	f := withMember(t, encodingZlib, 1<<48, zlibBytes([]byte("short")))
+	// 10000 is the most a 13-byte zlib stream can honestly declare (13*1032);
+	// anything higher is refused at Open, see TestZlibMemberBeyondTheRatio.
+	f := withMember(t, encodingZlib, 10000, zlibBytes([]byte("short")))
 	got, err := f.ReadFile("/hello.txt")
 	if err == nil {
 		t.Fatalf("ReadFile returned %d bytes for a member that holds five", len(got))

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path"
 	"strings"
@@ -27,6 +28,8 @@ type FS struct {
 	heap  int64
 	root  *entry
 	index map[string]*entry
+	// maxFile is the ceiling ReadFile applies to a member's decoded size.
+	maxFile int64
 }
 
 // Compile-time proof that the capabilities this package claims are the ones it
@@ -44,12 +47,51 @@ var (
 // Member data is NOT read: only the header and the table of contents are, and
 // each member is decoded when it is read. r must stay usable for as long as the
 // returned filesystem is.
+//
+// It applies the default limits; see Options and OpenReaderWith.
 func OpenReader(r io.ReaderAt, size int64) (filesystem.Filesystem, error) {
+	return OpenReaderWith(r, size, Options{})
+}
+
+// readFileHint is how much ReadFile reserves up front for a compressed member,
+// whose declared size is not yet earned.
+const readFileHint = 8 << 20
+
+// Defaults for Options.
+const (
+	// DefaultMaxEntries is the most <file> elements a table of contents may hold
+	// (1,048,576). A table of contents costs roughly two kilobytes of heap per
+	// entry while it is parsed.
+	DefaultMaxEntries = 1 << 20
+
+	// DefaultMaxFileSize is the largest member ReadFile will return (1 GiB).
+	DefaultMaxFileSize = 1 << 30
+)
+
+// Options tunes the limits applied to an untrusted archive. The zero value
+// selects the defaults.
+type Options struct {
+	// MaxEntries bounds the number of members. Zero means DefaultMaxEntries.
+	MaxEntries int
+	// MaxFileSize bounds what ReadFile will buffer, in decoded bytes. Zero means
+	// DefaultMaxFileSize. OpenFile is not affected: it streams.
+	MaxFileSize int64
+}
+
+// OpenReaderWith is OpenReader with explicit limits. A limit that is exceeded
+// fails with an error wrapping ErrTooLarge before the memory is reserved.
+func OpenReaderWith(r io.ReaderAt, size int64, opt Options) (filesystem.Filesystem, error) {
+	if opt.MaxEntries <= 0 {
+		opt.MaxEntries = DefaultMaxEntries
+	}
+	if opt.MaxFileSize <= 0 {
+		opt.MaxFileSize = DefaultMaxFileSize
+	}
 	hdr, err := parseHeader(r, size)
 	if err != nil {
 		return nil, err
 	}
-	arc, err := readTOC(r, hdr)
+	arc, err := readTOC(r, hdr, opt.MaxEntries)
 	if err != nil {
 		return nil, err
 	}
@@ -58,7 +100,7 @@ func OpenReader(r io.ReaderAt, size int64) (filesystem.Filesystem, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &FS{r: r, size: size, heap: heap, root: root, index: index}, nil
+	return &FS{r: r, size: size, heap: heap, root: root, index: index, maxFile: opt.MaxFileSize}, nil
 }
 
 // Close releases nothing: FS never opened the io.ReaderAt it was handed, so it
@@ -144,13 +186,34 @@ func (f *FS) ReadLink(p string) (string, error) {
 // not bounded by the archive's own length, so trusting it to size an allocation
 // lets a few hundred bytes of XML ask for as much memory as it likes. Use
 // OpenFile for anything whose size was not chosen here.
+//
+// A member larger than Options.MaxFileSize (DefaultMaxFileSize unless set) is
+// refused with ErrTooLarge before anything is read: compression amplifies, and
+// a 526 KiB zlib member can decode to 512 MiB. OpenFile streams in constant
+// memory and has no such limit.
 func (f *FS) ReadFile(p string) ([]byte, error) {
 	h, err := f.OpenFile(p)
 	if err != nil {
 		return nil, err
 	}
 	defer h.Close()
+	if sz := h.Size(); sz > f.maxFile || sz > math.MaxInt {
+		return nil, fmt.Errorf("%w: %s decodes to %d bytes, ReadFile's limit is %d (OpenFile streams)",
+			ErrTooLarge, p, sz, f.maxFile)
+	}
+	if h.(*handle).sec != nil {
+		// A stored member's size is its extent in the archive (checkExtent), so
+		// it is bounded by the input and can be reserved exactly.
+		buf := make([]byte, h.Size())
+		if _, err := io.ReadFull(io.NewSectionReader(h, 0, h.Size()), buf); err != nil {
+			return nil, fmt.Errorf("%w: %s: %w", ErrCorrupt, p, err)
+		}
+		return buf, nil
+	}
+	// A compressed member's size is a declaration, so it gets only a modest head
+	// start and the buffer then grows with what the decoder really produces.
 	var buf bytes.Buffer
+	buf.Grow(int(min(h.Size(), readFileHint)))
 	if _, err := io.Copy(&buf, io.NewSectionReader(h, 0, h.Size())); err != nil {
 		return nil, err
 	}

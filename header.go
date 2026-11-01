@@ -87,6 +87,14 @@ func parseHeader(r io.ReaderAt, size int64) (*header, error) {
 		return nil, fmt.Errorf("%w: table of contents is %d bytes at %d, past the end of a %d-byte archive",
 			ErrBadHeader, h.tocCompressed, h.headerSize, size)
 	}
+	// The table of contents is a zlib stream, and a zlib stream cannot expand
+	// more than zlibMaxRatio to one. A header that declares more is lying, and
+	// the declaration is what sizes the buffer readTOC allocates: without this a
+	// 347-byte archive reserved 64 MiB.
+	if int64(h.tocUncompressed) > maxInflate(int64(h.tocCompressed)) {
+		return nil, fmt.Errorf("%w: %d compressed bytes cannot decode to %d (at most %d:1)",
+			ErrBadHeader, h.tocCompressed, h.tocUncompressed, zlibMaxRatio)
+	}
 	return h, nil
 }
 
